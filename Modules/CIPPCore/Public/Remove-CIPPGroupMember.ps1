@@ -1,5 +1,5 @@
 function Remove-CIPPGroupMember(
-    [string]$ExecutingUser,
+    $Headers,
     [string]$GroupType,
     [string]$GroupId,
     [string]$Member,
@@ -7,23 +7,32 @@ function Remove-CIPPGroupMember(
     [string]$APIName = 'Remove Group Member'
 ) {
     try {
-        if ($member -like '*#EXT#*') { $member = [System.Web.HttpUtility]::UrlEncode($member) }
-        # $MemberIDs = 'https://graph.microsoft.com/v1.0/directoryObjects/' + (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users/$($member)" -tenantid $TenantFilter).id
-        # $addmemberbody = "{ `"members@odata.bind`": $(ConvertTo-Json @($MemberIDs)) }"
         if ($GroupType -eq 'Distribution list' -or $GroupType -eq 'Mail-Enabled Security') {
-            $Params = @{ Identity = $GroupId; Member = $member; BypassSecurityGroupManagerCheck = $true }
-            New-ExoRequest -tenantid $TenantFilter -cmdlet 'Remove-DistributionGroupMember' -cmdParams $params -UseSystemMailbox $true
+            $Params = @{ Identity = $GroupId; Member = $Member; BypassSecurityGroupManagerCheck = $true }
+            $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Remove-DistributionGroupMember' -cmdParams $Params -UseSystemMailbox $true
         } else {
-            New-GraphPostRequest -uri "https://graph.microsoft.com/beta/groups/$($GroupId)/members/$($Member)/`$ref" -tenantid $TenantFilter -type DELETE -body '{}' -Verbose
+            if ($Member -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                Write-Information "Member $Member is a GUID, proceeding with removal."
+            } else {
+                Write-Information "Member $Member is not a GUID, attempting to resolve to object ID."
+                if ($Member -like '*#EXT#*') { $Member = [System.Web.HttpUtility]::UrlEncode($Member) }
+                $UserObject = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/users/$($Member)?`$select=id" -tenantid $TenantFilter
+                if ($null -eq $UserObject.id) {
+                    throw "Could not resolve user $Member to an object ID."
+                }
+                $Member = $UserObject.id
+                Write-Information "Resolved member to object ID: $Member"
+            }
+            $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/groups/$($GroupId)/members/$($Member)/`$ref" -tenantid $TenantFilter -type DELETE -body '{}' -Verbose
         }
-        $Message = "Successfully removed user $($Member) from $($GroupId)."
-        Write-LogMessage -user $ExecutingUser -API $APIName -tenant $TenantFilter -message $Message -Sev 'Info'
-        return $message
+        $Results = "Successfully removed user $($Member) from $($GroupId)."
+        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev Info
+        return $Results
 
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        $message = "Failed to remove user $($Member) from $($GroupId): $($ErrorMessage.NormalizedError)"
-        Write-LogMessage -user $ExecutingUser -API $APIName -tenant $TenantFilter -message $message -Sev 'error' -LogData $ErrorMessage
-        return $message
+        $Results = "Failed to remove user $($Member) from $($GroupId): $($ErrorMessage.NormalizedError)"
+        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev Error -LogData $ErrorMessage
+        throw $Results
     }
 }
