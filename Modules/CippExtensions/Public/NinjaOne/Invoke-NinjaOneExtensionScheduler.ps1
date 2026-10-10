@@ -16,7 +16,11 @@ function Invoke-NinjaOneExtensionScheduler {
 
     Write-Host "Ninja Time Setting: $TimeSetting"
 
-    $LastRunTime = Get-Date(($Settings | Where-Object { $_.RowKey -eq 'NinjaLastRunTime' }).SettingValue)
+    try {
+        $LastRunTime = Get-Date(($Settings | Where-Object { $_.RowKey -eq 'NinjaLastRunTime' }).SettingValue)
+    } catch {
+        $LastRunTime = $Null
+    }
 
     Write-Host "Last Run: $LastRunTime"
 
@@ -28,23 +32,40 @@ function Invoke-NinjaOneExtensionScheduler {
     $CIPPMapping = Get-CIPPTable -TableName CippMapping
     $Filter = "PartitionKey eq 'NinjaOneMapping'"
     $TenantsToProcess = Get-AzDataTableEntity @CIPPMapping -Filter $Filter | Where-Object { $Null -ne $_.IntegrationId -and $_.IntegrationId -ne '' }
+    # Names each queued sync after its tenant (mapping rows only carry the tenant id).
+    $TenantDomains = @{}
+
+    # Same check as the integration test button, once, before queuing a task per mapped tenant.
+    $ApiCheck = {
+        $ExtTable = Get-CIPPTable -TableName Extensionsconfig
+        $NinjaConfig = ((Get-AzDataTableEntity @ExtTable).config | ConvertFrom-Json).NinjaOne
+        [bool](Get-NinjaOneToken -configuration $NinjaConfig).access_token
+    }
 
     if ($Null -eq $LastRunTime -or $LastRunTime -le (Get-Date).addhours(-25) -or $TimeSetting -eq $CurrentInterval) {
         Write-Host 'Executing'
+        if ($TenantsToProcess -and -not (& $ApiCheck)) {
+            Write-LogMessage -API 'NinjaOneSync' -message "NinjaOne API check failed, daily synchronization not queued for $(($TenantsToProcess | Measure-Object).count) tenants. Test the NinjaOne integration in Extensions." -Sev 'Error'
+            $TenantsToProcess = @()
+        }
+        if ($TenantsToProcess) { foreach ($T in Get-Tenants -IncludeErrors) { $TenantDomains[$T.customerId] = $T.defaultDomainName } }
         $Batch = foreach ($Tenant in $TenantsToProcess | Sort-Object lastEndTime) {
             [PSCustomObject]@{
+                'TenantFilter' = $TenantDomains[$Tenant.RowKey] ?? $Tenant.RowKey
                 'NinjaAction'  = 'SyncTenant'
                 'MappedTenant' = $Tenant
                 'FunctionName' = 'NinjaOneQueue'
             }
         }
+
         if (($Batch | Measure-Object).Count -gt 0) {
             $InputObject = [PSCustomObject]@{
                 OrchestratorName = 'NinjaOneOrchestrator'
+                Priority         = 6
                 Batch            = @($Batch)
             }
             #Write-Host ($InputObject | ConvertTo-Json)
-            $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+            $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
             Write-Host "Started permissions orchestration with ID = '$InstanceId'"
         }
 
@@ -55,7 +76,7 @@ function Invoke-NinjaOneExtensionScheduler {
         }
         Add-AzDataTableEntity @Table -Entity $AddObject -Force
 
-        Write-LogMessage -API 'NinjaOneSync' -user 'CIPP' -message "NinjaOne Daily Synchronization Queued for $(($TenantsToProcess | Measure-Object).count) Tenants" -Sev 'Info'
+        Write-LogMessage -API 'NinjaOneSync' -message "NinjaOne Daily Synchronization Queued for $(($TenantsToProcess | Measure-Object).count) Tenants" -Sev 'Info'
 
     } else {
         if ($LastRunTime -lt (Get-Date).AddMinutes(-90)) {
@@ -72,9 +93,15 @@ function Invoke-NinjaOneExtensionScheduler {
                     $_ | Add-Member -NotePropertyName lastStartTime -NotePropertyValue $Null -Force
                 }
             }
-            $CatchupTenants = $TenantsToProcess | Where-Object { (((($_.lastEndTime -eq $Null) -or ($_.lastStartTime -gt $_.lastEndTime)) -and ($_.lastStartTime -lt (Get-Date).AddMinutes(-30)))) -or ($_.lastStartTime -lt $LastRunTime) }
+            $CatchupTenants = $TenantsToProcess | Where-Object { ((($Null -eq $_.lastEndTime) -or ($_.lastStartTime -gt $_.lastEndTime)) -and ($_.lastStartTime -lt (Get-Date).AddHours(-3))) -or (($_.lastStartTime -lt $LastRunTime) -and ($Null -eq $_.lastEndTime -or $_.lastEndTime -lt $LastRunTime)) }
+            if ($CatchupTenants -and -not (& $ApiCheck)) {
+                Write-LogMessage -API 'NinjaOneSync' -message "NinjaOne API check failed, catchup synchronization not queued for $(($CatchupTenants | Measure-Object).count) tenants. Test the NinjaOne integration in Extensions." -Sev 'Warning'
+                $CatchupTenants = @()
+            }
+            if ($CatchupTenants) { foreach ($T in Get-Tenants -IncludeErrors) { $TenantDomains[$T.customerId] = $T.defaultDomainName } }
             $Batch = foreach ($Tenant in $CatchupTenants) {
                 [PSCustomObject]@{
+                    TenantFilter = $TenantDomains[$Tenant.RowKey] ?? $Tenant.RowKey
                     NinjaAction  = 'SyncTenant'
                     MappedTenant = $Tenant
                     FunctionName = 'NinjaOneQueue'
@@ -83,15 +110,16 @@ function Invoke-NinjaOneExtensionScheduler {
             if (($Batch | Measure-Object).Count -gt 0) {
                 $InputObject = [PSCustomObject]@{
                     OrchestratorName = 'NinjaOneOrchestrator'
+                    Priority         = 6
                     Batch            = @($Batch)
                 }
                 #Write-Host ($InputObject | ConvertTo-Json)
-                $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+                $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
                 Write-Host "Started permissions orchestration with ID = '$InstanceId'"
             }
 
             if (($CatchupTenants | Measure-Object).count -gt 0) {
-                Write-LogMessage -API 'NinjaOneSync' -user 'CIPP' -message "NinjaOne Synchronization Catchup Queued for $(($CatchupTenants | Measure-Object).count) Tenants" -Sev 'Info'
+                Write-LogMessage -API 'NinjaOneSync' -message "NinjaOne Synchronization Catchup Queued for $(($CatchupTenants | Measure-Object).count) Tenants" -Sev 'Info'
             }
 
         }
